@@ -76,6 +76,23 @@ pub async fn run(args: HandshakeArgs) -> Result<(), AlpineSdkError> {
 
     let session_id = client.session_id().unwrap_or_else(|| "unknown".to_string());
 
+    // TOFU: persist device identity pubkey if present and not already trusted.
+    if let Some(pubkey) = record.device_identity_pubkey.clone() {
+        if identity_store::load_trusted_device_key(&record.device_id).is_none() {
+            if let Err(err) = identity_store::store_trusted_device_key(&record.device_id, &pubkey) {
+                eprintln!(
+                    "[ALPINE][TRUST][WARN] failed to store device identity for {}: {}",
+                    record.device_id, err
+                );
+            } else {
+                println!(
+                    "[ALPINE][TRUST] new device identity trusted (TOFU): {}",
+                    record.device_id
+                );
+            }
+        }
+    }
+
     stream_session::save_session(&StoredSession {
         device_id: record.device_id.clone(),
         session_id: session_id.clone(),

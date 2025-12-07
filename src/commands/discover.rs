@@ -7,14 +7,14 @@ use clap::Args;
 use std::net::SocketAddr;
 use tracing::info;
 
-const DEFAULT_DIAG_UNICAST: &str = "192.168.39.121:9455";
+const DEFAULT_DIAG_UNICAST: &str = "192.168.39.121:19455";
 
 #[derive(Debug, Clone, Args)]
 pub struct DiscoverArgs {
-    /// Discovery target address (ip:port). Defaults to broadcast 255.255.255.255:9455.
+    /// Discovery target address (ip:port). Defaults to broadcast 255.255.255.255:19455.
     #[arg(value_name = "ip:port")]
     pub addr: Option<String>,
-    /// Force unicast discovery to a specific device. Defaults to 192.168.39.121:9455 if no value supplied.
+    /// Force unicast discovery to a specific device. Defaults to 192.168.39.121:19455 if no value supplied.
     #[arg(
         long,
         value_name = "ip:port",
@@ -63,8 +63,23 @@ pub async fn run(args: DiscoverArgs, default_remote: SocketAddr) -> anyhow::Resu
     );
     println!("peer: {}", outcome.peer);
     println!("local addr: {}", outcome.local_addr);
-    println!("discovery reply:");
-    println!("{:#?}", outcome.reply);
+    let caps = &outcome.reply.capabilities;
+    println!("discovery reply (human-friendly):");
+    println!("  alpine_version: {}", outcome.reply.alpine_version);
+    println!("  device_id: {}", outcome.reply.device_id);
+    println!("  manufacturer_id: {}", outcome.reply.manufacturer_id);
+    println!("  model_id: {}", outcome.reply.model_id);
+    println!("  hardware_rev: {}", outcome.reply.hardware_rev);
+    println!("  firmware_rev: {}", outcome.reply.firmware_rev);
+    println!("  mac: {}", outcome.reply.mac);
+    println!(
+        "  capabilities: channel_formats={:?} max_channels={} grouping_supported={} streaming_supported={} encryption_supported={}",
+        caps.channel_formats,
+        caps.max_channels,
+        caps.grouping_supported,
+        caps.streaming_supported,
+        caps.encryption_supported
+    );
 
     Ok(())
 }

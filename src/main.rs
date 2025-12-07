@@ -17,7 +17,7 @@ struct Cli {
     command: Commands,
 }
 
-const DEFAULT_DISCOVERY_ADDR: &str = "255.255.255.255:9455";
+const DEFAULT_DISCOVERY_ADDR: &str = "255.255.255.255:19455";
 
 #[derive(Subcommand)]
 enum Commands {

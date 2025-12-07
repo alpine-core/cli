@@ -1,32 +1,13 @@
-use std::{
-    env,
-    io::{self, IsTerminal},
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use alpine_protocol_sdk::{
-    AlpineClient, CapabilitySet, ChannelFormat, DeviceIdentity, StreamProfile,
+    AlpineClient, CapabilitySet, DeviceIdentity, HandshakeContext, StreamProfile,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
-};
-use serde::Deserialize;
+use clap::Args;
 use serde_json::Value;
-use tokio::time::sleep;
+use tokio::net::UdpSocket;
+use tokio::{signal, time};
 
 use crate::{
     device_cache::DeviceRecord,
@@ -35,40 +16,29 @@ use crate::{
     stream_session::{self, StoredSession},
 };
 
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone, Args)]
 pub struct StreamTestArgs {
     #[command(flatten)]
     pub selector: DeviceSelectorArgs,
-    /// Skip the TUI and print log output only (useful in terminals that do not support raw mode).
-    #[arg(long)]
-    pub no_ui: bool,
+
+    /// DMX universe number or identifier (e.g. "1" or "u1").
+    #[arg(long, default_value = "1")]
+    pub universe: String,
+
+    /// Channel overrides (1-indexed). Example: --ch 1=255 --ch 2=0
+    #[arg(long = "ch", value_parser = parse_ch_pair)]
+    pub ch_pairs: Vec<(usize, u8)>,
+
+    /// Interval between frames in milliseconds.
+    #[arg(long, default_value = "33")]
+    pub interval_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone)]
 struct CapabilityInfo {
-    #[serde(default)]
     streaming_supported: bool,
-    #[serde(default)]
     encryption_supported: bool,
-    #[serde(default)]
-    max_channels: Option<u32>,
-    #[serde(default)]
-    channel_formats: Vec<String>,
-}
-
-impl CapabilityInfo {
-    fn from_set(set: &CapabilitySet) -> Self {
-        Self {
-            streaming_supported: set.streaming_supported,
-            encryption_supported: set.encryption_supported,
-            max_channels: Some(set.max_channels),
-            channel_formats: set
-                .channel_formats
-                .iter()
-                .map(|format| format_name(format).to_string())
-                .collect(),
-        }
-    }
+    max_channels: usize,
 }
 
 pub async fn run(args: StreamTestArgs) -> Result<()> {
@@ -99,23 +69,58 @@ pub async fn run(args: StreamTestArgs) -> Result<()> {
             )
         })?;
 
-    let sender = SessionSender::new(&record, &session, &capability_set, &capabilities).await?;
-    let sender = Arc::new(Mutex::new(sender));
+    let universe = args.universe.clone();
+    let sender = SessionSender::new(&record, &session, &capability_set, &universe).await?;
+    let sender = Arc::new(sender);
 
-    let channel_count = determine_channel_count(&capabilities);
+    let values = build_frame(&capabilities, &args)?;
 
-    let ui_supported = terminal_supports_ui();
-    if args.no_ui || ui_supported.is_err() {
-        if let Err(reason) = ui_supported {
-            eprintln!(
-                "Stream test TUI disabled: {}.\nRun in a fully featured terminal (Windows Terminal, native Linux, iTerm2) for the interactive UI.",
-                reason
-            );
-        }
-        run_headless(record, capabilities, channel_count, sender).await
-    } else {
-        run_ui(record, capabilities, channel_count, sender).await
+    {
+        log_start(
+            &universe,
+            &values,
+            args.interval_ms,
+            sender.local_addr(),
+            sender.remote_addr(),
+        );
     }
+
+    let mut ticker = time::interval(Duration::from_millis(args.interval_ms));
+    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
+    let mut heartbeat = time::interval(Duration::from_millis(2000));
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Err(err) = sender.send_frame(&values).await {
+                    eprintln!("[ALPINE][STREAM][ERROR] frame send failed: {}", err);
+                    break;
+                }
+            }
+            _ = heartbeat.tick() => {
+                println!("[ALPINE][STREAM] still sending...");
+            }
+            _ = signal::ctrl_c() => {
+                println!("[ALPINE][STREAM] Ctrl+C received; stopping.");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn build_frame(caps: &CapabilityInfo, args: &StreamTestArgs) -> Result<Vec<u8>> {
+    let mut values = vec![0u8; caps.max_channels.max(512).min(512)];
+    for (idx, val) in args.ch_pairs.iter() {
+        if *idx == 0 || *idx > values.len() {
+            bail!("channel index {} out of range 1..={}", idx, values.len());
+        }
+        values[idx - 1] = *val;
+    }
+    Ok(values)
 }
 
 fn load_capability_set(value: Option<&Value>) -> CapabilitySet {
@@ -126,345 +131,21 @@ fn load_capability_set(value: Option<&Value>) -> CapabilitySet {
     }
 }
 
-fn determine_channel_count(caps: &CapabilityInfo) -> usize {
-    let max = caps.max_channels.unwrap_or(64);
-    (max.max(1).min(512)) as usize
-}
-
-fn terminal_supports_ui() -> Result<(), String> {
-    if !io::stdout().is_terminal() {
-        return Err("stdout is not a TTY".into());
-    }
-    let term = env::var("TERM").unwrap_or_default();
-    if term.is_empty() || term == "dumb" {
-        return Err(format!("unsupported TERM value: {}", term));
-    }
-    let colorterm = env::var("COLORTERM").unwrap_or_default();
-    let is_jetbrains = env::var("JETBRAINS_IDE").is_ok()
-        || env::var("IDEA_INITIAL_DIRECTORY").is_ok()
-        || env::var("TERMINAL_EMULATOR")
-            .map(|v| v.to_lowercase().contains("jetbrains"))
-            .unwrap_or(false);
-    if is_jetbrains {
-        return Err(
-            "JetBrains embedded terminal is known to misrender alternate screen/raw mode under WSL"
-                .into(),
-        );
-    }
-    if colorterm.to_lowercase() == "truecolor" || term.contains("xterm") {
-        return Ok(());
-    }
-    Ok(())
-}
-
-async fn run_ui(
-    record: DeviceRecord,
-    capabilities: CapabilityInfo,
-    channel_count: usize,
-    sender: Arc<Mutex<SessionSender>>,
-) -> Result<()> {
-    tokio::task::spawn_blocking(move || blocking_ui(record, capabilities, channel_count, sender))
-        .await?
-}
-
-async fn run_headless(
-    record: DeviceRecord,
-    capabilities: CapabilityInfo,
-    channel_count: usize,
-    sender: Arc<Mutex<SessionSender>>,
-) -> Result<()> {
-    println!(
-        "[ALPINE][STREAM] starting headless stream test for device {} ({})",
-        record.device_id, record.model_id
-    );
-    println!(
-        "Capabilities: formats={:?} max_channels={}",
-        capabilities.channel_formats,
-        capabilities.max_channels.unwrap_or(0)
-    );
-    println!("Sending sample frames (press Ctrl+C to stop)...");
-
-    let mut values = vec![0u8; channel_count];
-    for tick in 0..20 {
-        // Simple ramp pattern
-        for (idx, val) in values.iter_mut().enumerate() {
-            *val = ((idx + tick) % 256) as u8;
-        }
-        let mut guard = sender.lock().unwrap();
-        if let Err(err) = guard.send_frame(&values) {
-            eprintln!("[ALPINE][STREAM][ERROR] frame send failed: {}", err);
-            break;
-        } else {
-            println!(
-                "[ALPINE][STREAM] sent frame {} ({} channels)",
-                tick + 1,
-                values.len()
-            );
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-    println!("[ALPINE][STREAM] headless stream test complete.");
-    Ok(())
-}
-
-fn blocking_ui(
-    record: DeviceRecord,
-    capabilities: CapabilityInfo,
-    channel_count: usize,
-    sender: Arc<Mutex<SessionSender>>,
-) -> Result<()> {
-    let mut stdout = io::stdout();
-    enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
-
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut state = ChannelState::new(channel_count);
-    let mut status_message =
-        Some("Use Up/Down select, Left/Right adjust, PgUp/PgDn page, q to quit".to_string());
-
-    let loop_result = run_event_loop(
-        &mut terminal,
-        &record,
-        &capabilities,
-        &mut state,
-        &sender,
-        &mut status_message,
-    );
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
-    loop_result
-}
-
-fn run_event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    record: &DeviceRecord,
-    capabilities: &CapabilityInfo,
-    state: &mut ChannelState,
-    sender: &Arc<Mutex<SessionSender>>,
-    status_message: &mut Option<String>,
-) -> Result<()> {
-    loop {
-        terminal.draw(|frame| {
-            draw_frame(frame, state, record, capabilities, status_message);
-        })?;
-
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Key(key) => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Up => state.move_selection(-1),
-                    KeyCode::Down => state.move_selection(1),
-                    KeyCode::Left => {
-                        if state.adjust_selected_value(-1) {
-                            let mut guard = sender.lock().unwrap();
-                            if let Err(err) = guard.send_frame(&state.values) {
-                                *status_message = Some(format!("frame error: {}", err));
-                            } else {
-                                *status_message =
-                                    Some(format!("sent frame for channel {}", state.selected + 1));
-                            }
-                        }
-                    }
-                    KeyCode::Right => {
-                        if state.adjust_selected_value(1) {
-                            let mut guard = sender.lock().unwrap();
-                            if let Err(err) = guard.send_frame(&state.values) {
-                                *status_message = Some(format!("frame error: {}", err));
-                            } else {
-                                *status_message =
-                                    Some(format!("sent frame for channel {}", state.selected + 1));
-                            }
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        state.move_selection(-(state.page_rows() as isize));
-                    }
-                    KeyCode::PageDown => {
-                        state.move_selection(state.page_rows() as isize);
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
-        }
-    }
-}
-
-fn draw_frame<B: ratatui::backend::Backend>(
-    frame: &mut ratatui::Frame<B>,
-    state: &mut ChannelState,
-    record: &DeviceRecord,
-    capabilities: &CapabilityInfo,
-    status_message: &Option<String>,
-) {
-    let size = frame.size();
-
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Length(3),
-                Constraint::Min(6),
-                Constraint::Length(2),
-                Constraint::Length(2),
-            ]
-            .as_ref(),
-        )
-        .split(size);
-
-    let format_desc = capabilities
-        .channel_formats
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "u8".to_string());
-    let header = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "ALPINE STREAM TEST",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::raw(format!("{} ({})", record.device_id, record.manufacturer_id)),
-        Span::raw(" | "),
-        Span::raw(format!("channels {}", state.values.len())),
-        Span::raw(" | "),
-        Span::raw(format!("format {}", format_desc)),
-        Span::raw(" | ALPINE "),
-        Span::raw(&record.alpine_version),
-        Span::raw(" | Encrypted"),
-    ]))
-    .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(header, outer[0]);
-
-    let window_rows = outer[1].height.saturating_sub(3) as usize;
-    let (start, end) = state.visible_range(window_rows);
-
-    let rows: Vec<Row> = (start..end)
-        .map(|idx| {
-            let value = state.values[idx];
-            Row::new(vec![
-                Cell::from(format!("{:>3}", idx + 1)),
-                Cell::from(format!("{:>3}", value)),
-                Cell::from(format!("{:>3}%", percentage(value))),
-            ])
-        })
-        .collect();
-
-    let mut table_state = state.table_state.clone();
-    let relative = state.selected.saturating_sub(start);
-    if relative < rows.len() {
-        table_state.select(Some(relative));
-    } else {
-        table_state.select(None);
-    }
-
-    let table = Table::new(rows)
-        .header(
-            Row::new(["Channel", "Value", "Level"])
-                .style(Style::default().fg(Color::Yellow))
-                .bottom_margin(0),
-        )
-        .block(Block::default().borders(Borders::ALL).title("Channels"))
-        .highlight_style(
-            Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .widths(&[
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(10),
-        ]);
-
-    frame.render_stateful_widget(table, outer[1], &mut table_state);
-    state.table_state = table_state;
-
-    let instructions = Paragraph::new(Line::from(vec![Span::raw(
-        "Up/Down select  Left/Right adjust  PgUp/PgDn page  q quit",
-    )]))
-    .block(Block::default().borders(Borders::ALL).title("Keys"));
-    frame.render_widget(instructions, outer[2]);
-
-    let status = Paragraph::new(status_message.clone().unwrap_or_default())
-        .block(Block::default().borders(Borders::ALL).title("Status"));
-    frame.render_widget(status, outer[3]);
-}
-
-fn percentage(value: u8) -> u8 {
-    ((value as u16 * 100) / 255) as u8
-}
-
-struct ChannelState {
-    values: Vec<u8>,
-    selected: usize,
-    window_start: usize,
-    table_state: TableState,
-}
-
-impl ChannelState {
-    fn new(count: usize) -> Self {
+impl CapabilityInfo {
+    fn from_set(set: &CapabilitySet) -> Self {
         Self {
-            values: vec![0; count],
-            selected: 0,
-            window_start: 0,
-            table_state: TableState::default(),
+            streaming_supported: set.streaming_supported,
+            encryption_supported: set.encryption_supported,
+            max_channels: set.max_channels as usize,
         }
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        let count = self.values.len() as isize;
-        let next = (self.selected as isize + delta).clamp(0, count - 1) as usize;
-        self.selected = next;
-    }
-
-    fn adjust_selected_value(&mut self, delta: i16) -> bool {
-        let value = self.values[self.selected] as i16;
-        let next = (value + delta).clamp(0, 255) as u8;
-        if next != self.values[self.selected] {
-            self.values[self.selected] = next;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn visible_range(&mut self, window_rows: usize) -> (usize, usize) {
-        if window_rows == 0 {
-            return (0, 0);
-        }
-        let max_start = self.values.len().saturating_sub(window_rows);
-        let mut start = self.window_start.min(max_start);
-        if self.selected < start {
-            start = self.selected;
-        } else if self.selected >= start + window_rows {
-            start = self
-                .selected
-                .saturating_sub(window_rows.saturating_sub(1))
-                .min(max_start);
-        }
-        self.window_start = start;
-        let end = (start + window_rows).min(self.values.len());
-        (start, end)
-    }
-
-    fn page_rows(&self) -> usize {
-        10
     }
 }
 
 struct SessionSender {
     client: AlpineClient,
-    channel_format: ChannelFormat,
-    priority: u8,
     stream_id: String,
     stream_kind: String,
+    socket: Arc<UdpSocket>,
 }
 
 impl SessionSender {
@@ -472,7 +153,7 @@ impl SessionSender {
         record: &DeviceRecord,
         session: &StoredSession,
         capability_set: &CapabilitySet,
-        capabilities: &CapabilityInfo,
+        stream_id: &str,
     ) -> Result<Self> {
         let local_addr: SocketAddr = session
             .local_addr
@@ -497,24 +178,71 @@ impl SessionSender {
 
         let cap_set = capability_set.clone();
 
-        let mut client =
-            AlpineClient::connect(local_addr, remote_addr, identity, cap_set, credentials).await?;
+        let mut ctx = HandshakeContext::default();
+        if let Some(pk) = record
+            .trusted_device_pubkey
+            .clone()
+            .or_else(|| record.device_identity_pubkey.clone())
+        {
+            ctx = ctx.with_device_identity_pubkey(pk);
+        } else {
+            eprintln!(
+                "[ALPINE][TRUST][WARN] no trusted device identity found for {}; validation may fail",
+                record.device_id
+            );
+        }
+
+        let client_nonce = record.client_nonce.clone().ok_or_else(|| {
+            anyhow!("missing cached client nonce; rerun alpine discover/handshake")
+        })?;
+
+        // Bind once and reuse for handshake + frames.
+        let std_sock = std::net::UdpSocket::bind(SocketAddr::new(local_addr.ip(), 0))
+            .map_err(|e| alpine_protocol_sdk::AlpineSdkError::Io(format!("bind: {}", e)))?;
+        std_sock
+            .connect(remote_addr)
+            .map_err(|e| alpine_protocol_sdk::AlpineSdkError::Io(format!("connect: {}", e)))?;
+        std_sock.set_nonblocking(true).map_err(|e| {
+            alpine_protocol_sdk::AlpineSdkError::Io(format!("set_nonblocking: {}", e))
+        })?;
+        let tokio_sock = tokio::net::UdpSocket::from_std(std_sock).map_err(|e| {
+            alpine_protocol_sdk::AlpineSdkError::Io(format!("to tokio socket: {}", e))
+        })?;
+
+        let mut client = AlpineClient::connect_with_socket_and_nonce(
+            tokio_sock,
+            remote_addr,
+            identity,
+            cap_set,
+            credentials,
+            client_nonce,
+            ctx,
+        )
+        .await?;
+
+        let socket = client.udp_socket();
 
         client.start_stream(StreamProfile::auto())?;
 
-        let channel_format = select_format(capabilities);
-
         Ok(Self {
             client,
-            channel_format,
-            priority: 0,
-            stream_id: "levels".to_string(),
+            stream_id: stream_id.to_string(),
             stream_kind: "alpine_levels".to_string(),
+            socket,
         })
     }
 
-    fn send_frame(&mut self, values: &[u8]) -> Result<(), alpine_protocol_sdk::AlpineSdkError> {
-        // Encode embedded runtime stream frame (type=alpine_frame, session_id, stream_id/kind, payload bstr).
+    fn local_addr(&self) -> SocketAddr {
+        self.socket
+            .local_addr()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)))
+    }
+
+    fn remote_addr(&self) -> SocketAddr {
+        self.client.remote_addr()
+    }
+
+    async fn send_frame(&self, values: &[u8]) -> Result<(), alpine_protocol_sdk::AlpineSdkError> {
         #[derive(serde::Serialize)]
         struct EmbeddedFrame<'a> {
             #[serde(rename = "type")]
@@ -540,41 +268,53 @@ impl SessionSender {
         let bytes = serde_cbor::to_vec(&frame)
             .map_err(|e| alpine_protocol_sdk::AlpineSdkError::Io(format!("encode: {}", e)))?;
 
-        let local = self.client.local_addr();
-        let remote = self.client.remote_addr();
-        let bind = SocketAddr::new(local.ip(), 0);
-        let sock = std::net::UdpSocket::bind(bind)
-            .map_err(|e| alpine_protocol_sdk::AlpineSdkError::Io(format!("bind: {}", e)))?;
-        sock.connect(remote)
-            .map_err(|e| alpine_protocol_sdk::AlpineSdkError::Io(format!("connect: {}", e)))?;
-        let sent = sock
+        self.socket
             .send(&bytes)
+            .await
             .map_err(|e| alpine_protocol_sdk::AlpineSdkError::Io(format!("send: {}", e)))?;
-        println!(
-            "[ALPINE][STREAM][TX] bytes={} channels={} local={} remote={}",
-            sent,
-            values.len(),
-            sock.local_addr().unwrap_or(bind),
-            remote
-        );
         Ok(())
     }
 }
 
-fn select_format(capabilities: &CapabilityInfo) -> ChannelFormat {
-    let candidate = capabilities.channel_formats.iter().find_map(|format| {
-        match format.to_lowercase().as_str() {
-            "u8" => Some(ChannelFormat::U8),
-            "u16" => Some(ChannelFormat::U16),
-            _ => None,
-        }
-    });
-    candidate.unwrap_or(ChannelFormat::U8)
+fn parse_ch_pair(s: &str) -> Result<(usize, u8), String> {
+    let parts: Vec<_> = s.split('=').collect();
+    if parts.len() != 2 {
+        return Err("expected format N=V".into());
+    }
+    let idx: usize = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| "channel index must be a number".to_string())?;
+    let val: u8 = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| "channel value must be 0-255".to_string())?;
+    if idx == 0 || idx > 512 {
+        return Err("channel index must be 1..=512".into());
+    }
+    Ok((idx, val))
 }
 
-fn format_name(format: &ChannelFormat) -> &'static str {
-    match format {
-        ChannelFormat::U8 => "u8",
-        ChannelFormat::U16 => "u16",
+fn log_start(
+    universe: &str,
+    values: &[u8],
+    interval_ms: u64,
+    local: SocketAddr,
+    remote: SocketAddr,
+) {
+    let mut parts = Vec::new();
+    for i in 0..values.len().min(8) {
+        parts.push(format!("CH{}={}", i + 1, values[i]));
     }
+    println!(
+        "[ALPINE][STREAM] universe={} local={} remote={} {}",
+        universe,
+        local,
+        remote,
+        parts.join(" ")
+    );
+    println!(
+        "[ALPINE][STREAM] sending every {}ms (Ctrl+C to stop)",
+        interval_ms
+    );
 }

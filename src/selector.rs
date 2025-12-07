@@ -1,4 +1,5 @@
 use crate::device_cache::{self, DeviceRecord};
+use crate::identity_store;
 use crate::parse_socket;
 use anyhow::{Context, Result};
 use clap::Args;
@@ -49,23 +50,41 @@ pub fn resolve_device(args: &DeviceSelectorArgs) -> Result<ResolvedDevice> {
     let devices = device_cache::load_devices().context("failed to read device cache")?;
 
     if let Some(id) = args.id.as_ref() {
-        return select_device(&devices, "--id", id, |record| record.matches_id(id))
-            .map_err(|err| anyhow::anyhow!(err));
+        let mut resolved = select_device(&devices, "--id", id, |record| record.matches_id(id))
+            .map_err(|err| anyhow::anyhow!(err))?;
+        if let Some(record) = resolved.record.as_mut() {
+            maybe_fill_trusted_pubkey(record);
+        }
+        return Ok(resolved);
     }
     if let Some(name) = args.name.as_ref() {
-        return select_device(&devices, "--name", name, |record| record.matches_name(name))
-            .map_err(|err| anyhow::anyhow!(err));
+        let mut resolved =
+            select_device(&devices, "--name", name, |record| record.matches_name(name))
+                .map_err(|err| anyhow::anyhow!(err))?;
+        if let Some(record) = resolved.record.as_mut() {
+            maybe_fill_trusted_pubkey(record);
+        }
+        return Ok(resolved);
     }
     if let Some(manufacturer) = args.manufacturer.as_ref() {
-        return select_device(&devices, "--manufacturer", manufacturer, |record| {
+        let mut resolved = select_device(&devices, "--manufacturer", manufacturer, |record| {
             record.matches_manufacturer(manufacturer)
         })
-        .map_err(|err| anyhow::anyhow!(err));
+        .map_err(|err| anyhow::anyhow!(err))?;
+        if let Some(record) = resolved.record.as_mut() {
+            maybe_fill_trusted_pubkey(record);
+        }
+        return Ok(resolved);
     }
 
     if let Some(target) = args.target.as_ref() {
         match select_device(&devices, "--id", target, |record| record.matches_id(target)) {
-            Ok(resolved) => return Ok(resolved),
+            Ok(mut resolved) => {
+                if let Some(record) = resolved.record.as_mut() {
+                    maybe_fill_trusted_pubkey(record);
+                }
+                return Ok(resolved);
+            }
             Err(SelectorError::NoMatches { .. }) => (),
             Err(err) => return Err(anyhow::anyhow!(err)),
         }
@@ -73,7 +92,12 @@ pub fn resolve_device(args: &DeviceSelectorArgs) -> Result<ResolvedDevice> {
         match select_device(&devices, "--name", target, |record| {
             record.matches_name(target)
         }) {
-            Ok(resolved) => return Ok(resolved),
+            Ok(mut resolved) => {
+                if let Some(record) = resolved.record.as_mut() {
+                    maybe_fill_trusted_pubkey(record);
+                }
+                return Ok(resolved);
+            }
             Err(SelectorError::NoMatches { .. }) => (),
             Err(err) => return Err(anyhow::anyhow!(err)),
         }
@@ -108,7 +132,11 @@ where
             filter,
             value: value.to_string(),
         }),
-        1 => match_cached_address(&matches[0], filter, value),
+        1 => {
+            let mut record = matches[0].clone();
+            maybe_fill_trusted_pubkey(&mut record);
+            match_cached_address(&record, filter, value)
+        }
         _ => Err(SelectorError::MultipleMatches {
             filter,
             value: value.to_string(),
@@ -138,6 +166,15 @@ fn match_cached_address(
         record: Some(record.clone()),
         addr,
     })
+}
+
+fn maybe_fill_trusted_pubkey(record: &mut DeviceRecord) {
+    if record.device_identity_pubkey.is_none() {
+        if let Some(stored) = identity_store::load_trusted_device_key(&record.device_id) {
+            record.device_identity_pubkey = Some(stored.clone());
+            record.trusted_device_pubkey = Some(stored);
+        }
+    }
 }
 
 #[derive(Debug)]

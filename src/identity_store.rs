@@ -88,3 +88,28 @@ pub fn signing_key_path() -> PathBuf {
 pub fn verifying_key_path() -> PathBuf {
     config_dir().join(VERIFYING_PEM)
 }
+
+pub fn trusted_device_dir() -> PathBuf {
+    config_dir().join("trusted_devices")
+}
+
+pub fn trusted_device_key_path(device_id: &str) -> PathBuf {
+    trusted_device_dir().join(format!("{}.pub", device_id))
+}
+
+pub fn store_trusted_device_key(device_id: &str, pubkey: &[u8]) -> anyhow::Result<()> {
+    let dir = trusted_device_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = trusted_device_key_path(device_id);
+    std::fs::write(&path, pubkey)?;
+    Ok(())
+}
+
+pub fn load_trusted_device_key(device_id: &str) -> Option<Vec<u8>> {
+    let path = trusted_device_key_path(device_id);
+    if let Ok(bytes) = std::fs::read(&path) {
+        Some(bytes)
+    } else {
+        None
+    }
+}

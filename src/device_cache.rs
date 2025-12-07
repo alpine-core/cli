@@ -22,9 +22,13 @@ pub struct DeviceRecord {
     #[serde(default)]
     pub discovery_local_addr: Option<String>,
     #[serde(default)]
+    pub discovery_interface: Option<String>,
+    #[serde(default)]
     pub client_nonce: Option<Vec<u8>>,
     #[serde(default)]
     pub device_identity_pubkey: Option<Vec<u8>>,
+    #[serde(default)]
+    pub trusted_device_pubkey: Option<Vec<u8>>,
     pub last_seen: u64,
     #[serde(default)]
     pub capabilities: Option<Value>,
@@ -43,10 +47,12 @@ impl DeviceRecord {
             mac: outcome.reply.mac.clone(),
             last_addr: Some(outcome.peer.to_string()),
             discovery_local_addr: Some(outcome.local_addr.to_string()),
+            discovery_interface: outcome.interface.clone(),
             last_seen,
             capabilities: serde_json::to_value(&outcome.reply.capabilities).ok(),
             client_nonce: Some(outcome.client_nonce.clone()),
             device_identity_pubkey: outcome.device_identity_pubkey.clone(),
+            trusted_device_pubkey: None,
         }
     }
 
