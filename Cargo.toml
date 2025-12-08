@@ -2,6 +2,8 @@
 name = "alpine-protocol-cli"
 version = "0.1.0"
 edition = "2024"
+description = "CLI Tool for ALPINE Protocol"
+license = "MIT"
 
 [[bin]]
 name = "alpine"
