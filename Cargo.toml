@@ -1,6 +1,6 @@
 [package]
 name = "alpine-protocol-cli"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "CLI Tool for ALPINE Protocol"
 license = "MIT"
@@ -10,7 +10,7 @@ name = "alpine"
 path = "src/main.rs"
 
 [dependencies]
-alpine-protocol-sdk = { path = "../sdk", version = "0.2.0" }
+alpine-protocol-sdk = "0.2.1"
 rand = "0.8"
 serde_cbor = "0.11"
 directories = "5.0"
