@@ -5,6 +5,7 @@ pub mod identity_store;
 pub mod netinfo;
 pub mod selector;
 pub mod stream_session;
+pub mod trust;
 
 use std::net::SocketAddr;
 

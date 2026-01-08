@@ -76,21 +76,49 @@ pub async fn run(args: HandshakeArgs) -> Result<(), AlpineSdkError> {
 
     let session_id = client.session_id().unwrap_or_else(|| "unknown".to_string());
 
-    // TOFU: persist device identity pubkey if present and not already trusted.
     if let Some(pubkey) = record.device_identity_pubkey.clone() {
-        if identity_store::load_trusted_device_key(&record.device_id).is_none() {
-            if let Err(err) = identity_store::store_trusted_device_key(&record.device_id, &pubkey) {
-                eprintln!(
-                    "[ALPINE][TRUST][WARN] failed to store device identity for {}: {}",
-                    record.device_id, err
-                );
-            } else {
-                println!(
-                    "[ALPINE][TRUST] new device identity trusted (TOFU): {}",
-                    record.device_id
-                );
+        let already_trusted = identity_store::load_trusted_device_key(&record.device_id).is_some();
+        if record.device_identity_trusted {
+            if !already_trusted {
+                if let Err(err) =
+                    identity_store::store_trusted_device_key(&record.device_id, &pubkey)
+                {
+                    eprintln!(
+                        "[ALPINE][TRUST][WARN] failed to store attested device identity for {}: {}",
+                        record.device_id, err
+                    );
+                } else {
+                    println!(
+                        "[ALPINE][TRUST] attested device identity trusted: {}",
+                        record.device_id
+                    );
+                }
+            }
+        } else {
+            eprintln!(
+                "[ALPINE][TRUST][WARN] device identity untrusted; attestation missing or invalid"
+            );
+            // TOFU: persist device identity pubkey if present and not already trusted.
+            if !already_trusted {
+                if let Err(err) =
+                    identity_store::store_trusted_device_key(&record.device_id, &pubkey)
+                {
+                    eprintln!(
+                        "[ALPINE][TRUST][WARN] failed to store device identity for {}: {}",
+                        record.device_id, err
+                    );
+                } else {
+                    println!(
+                        "[ALPINE][TRUST] new device identity trusted (TOFU): {}",
+                        record.device_id
+                    );
+                }
             }
         }
+    } else if !record.device_identity_trusted {
+        eprintln!(
+            "[ALPINE][TRUST][WARN] device identity untrusted; no identity pubkey present"
+        );
     }
 
     stream_session::save_session(&StoredSession {

@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use alpine_protocol_cli::{
-    commands::{conformance, discover, handshake, identity, ping, session, status, stream},
+    commands::{conformance, discover, handshake, identity, ping, session, status, stream, trust},
     netinfo,
     selector::DeviceSelectorArgs,
 };
@@ -27,6 +27,10 @@ enum Commands {
     Ping(DeviceSelectorArgs),
     Status(DeviceSelectorArgs),
     Identity(DeviceSelectorArgs),
+    Trust {
+        #[command(subcommand)]
+        command: trust::TrustCommand,
+    },
     Session {
         #[command(subcommand)]
         command: session::SessionCommand,
@@ -73,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Identity(selector) => {
             identity::run(selector).await?;
+        }
+        Commands::Trust { command } => {
+            trust::run(command).await?;
         }
         Commands::Session { command } => match command {
             session::SessionCommand::List => session::list()?,

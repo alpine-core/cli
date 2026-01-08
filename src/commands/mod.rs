@@ -6,3 +6,4 @@ pub mod ping;
 pub mod session;
 pub mod status;
 pub mod stream;
+pub mod trust;

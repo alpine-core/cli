@@ -28,6 +28,10 @@ pub struct DeviceRecord {
     #[serde(default)]
     pub device_identity_pubkey: Option<Vec<u8>>,
     #[serde(default)]
+    pub device_identity_attestation: Option<Vec<u8>>,
+    #[serde(default)]
+    pub device_identity_trusted: bool,
+    #[serde(default)]
     pub trusted_device_pubkey: Option<Vec<u8>>,
     pub last_seen: u64,
     #[serde(default)]
@@ -52,6 +56,12 @@ impl DeviceRecord {
             capabilities: serde_json::to_value(&outcome.reply.capabilities).ok(),
             client_nonce: Some(outcome.client_nonce.clone()),
             device_identity_pubkey: outcome.device_identity_pubkey.clone(),
+            device_identity_attestation: if outcome.reply.device_identity_attestation.is_empty() {
+                None
+            } else {
+                Some(outcome.reply.device_identity_attestation.clone())
+            },
+            device_identity_trusted: outcome.device_identity_trusted,
             trusted_device_pubkey: None,
         }
     }

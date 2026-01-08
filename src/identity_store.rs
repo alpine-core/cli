@@ -93,6 +93,7 @@ pub fn trusted_device_dir() -> PathBuf {
     config_dir().join("trusted_devices")
 }
 
+
 pub fn trusted_device_key_path(device_id: &str) -> PathBuf {
     trusted_device_dir().join(format!("{}.pub", device_id))
 }
